@@ -2232,17 +2232,18 @@ async function extractGoogleSerp(page) {
 
 const REFRESH_READY_TIMEOUT_MS = 2500;
 
-async function buildRefs(page) {
+async function buildRefs(page, scopeSelector = null) {
   const refs = new Map();
-  
+
   if (!page || page.isClosed()) {
     log('warn', 'buildRefs: page closed or invalid');
     return refs;
   }
-  
-  // Google SERP fast path -- skip ariaSnapshot entirely
+
+  // Google SERP fast path -- skip ariaSnapshot entirely (not when scoped:
+  // the caller asked for a specific subtree, so honor it)
   const url = page.url();
-  if (isGoogleSerp(url)) {
+  if (!scopeSelector && isGoogleSerp(url)) {
     const { refs: googleRefs } = await extractGoogleSerp(page);
     return googleRefs;
   }
@@ -2257,7 +2258,7 @@ async function buildRefs(page) {
   
   try {
     const result = await Promise.race([
-      _buildRefsInner(page, refs, start),
+      _buildRefsInner(page, refs, start, scopeSelector),
       timeoutPromise
     ]);
     clearTimeout(timerId);
@@ -2272,7 +2273,7 @@ async function buildRefs(page) {
   }
 }
 
-async function _buildRefsInner(page, refs, start) {
+async function _buildRefsInner(page, refs, start, scopeSelector = null) {
   await waitForPageReady(page, {
     timeout: REFRESH_READY_TIMEOUT_MS,
     waitForNetwork: false,
@@ -2288,15 +2289,17 @@ async function _buildRefsInner(page, refs, start) {
     return refs;
   }
   
+  // .first() so a multi-match selector doesn't trip strict mode
+  const snapshotRoot = scopeSelector ? page.locator(scopeSelector).first() : page.locator('body');
   let ariaYaml;
   try {
-    ariaYaml = await page.locator('body').ariaSnapshot({ timeout: Math.min(remaining - 1000, 5000) });
+    ariaYaml = await snapshotRoot.ariaSnapshot({ timeout: Math.min(remaining - 1000, 5000) });
   } catch (err) {
     log('warn', 'ariaSnapshot failed, retrying');
     const retryBudget = BUILDREFS_TIMEOUT_MS - (Date.now() - start);
     if (retryBudget < 2000) return refs;
     try {
-      ariaYaml = await page.locator('body').ariaSnapshot({ timeout: Math.min(retryBudget - 500, 5000) });
+      ariaYaml = await snapshotRoot.ariaSnapshot({ timeout: Math.min(retryBudget - 500, 5000) });
     } catch (retryErr) {
       log('warn', 'ariaSnapshot retry failed, returning empty refs', { error: retryErr.message });
       return refs;
@@ -2342,8 +2345,9 @@ async function _buildRefsInner(page, refs, start) {
   
   // --- IFRAME SUPPORT ---
   // Process child frames to capture elements inside iframes (e.g., Stripe payment fields)
+  // Skipped when scoped: a selector scopes to a main-frame subtree.
   const iframeRemaining = BUILDREFS_TIMEOUT_MS - (Date.now() - start);
-  if (iframeRemaining > 2000 && refCounter <= MAX_SNAPSHOT_NODES) {
+  if (!scopeSelector && iframeRemaining > 2000 && refCounter <= MAX_SNAPSHOT_NODES) {
     const childFrames = page.frames().filter(f => f !== page.mainFrame());
     let iframesProcessed = 0;
     
@@ -2412,7 +2416,7 @@ async function _buildRefsInner(page, refs, start) {
   return refs;
 }
 
-async function getAriaSnapshot(page) {
+async function getAriaSnapshot(page, scopeSelector = null) {
   if (!page || page.isClosed()) {
     return null;
   }
@@ -2422,16 +2426,20 @@ async function getAriaSnapshot(page) {
     waitForHydration: false,
     settleMs: 100,
   });
+  const snapshotRoot = scopeSelector ? page.locator(scopeSelector).first() : page.locator('body');
   let mainYaml;
   try {
-    mainYaml = await page.locator('body').ariaSnapshot({ timeout: 5000 });
+    mainYaml = await snapshotRoot.ariaSnapshot({ timeout: 5000 });
   } catch (err) {
-    log('warn', 'getAriaSnapshot failed', { error: err.message });
+    log('warn', 'getAriaSnapshot failed', { error: err.message, scopeSelector });
     return null;
   }
-  
+
   if (!mainYaml) return null;
-  
+
+  // Scoped snapshots cover a main-frame subtree only -- skip iframe append
+  if (scopeSelector) return mainYaml;
+
   // --- IFRAME SUPPORT ---
   // Append accessible iframe content to the snapshot YAML
   const childFrames = page.frames().filter(f => f !== page.mainFrame());
@@ -2480,7 +2488,7 @@ async function getAriaSnapshot(page) {
   return mainYaml;
 }
 
-function refToLocator(page, ref, refs) {
+function refToLocator(page, ref, refs, scopeSelector = null) {
   const info = refs.get(ref);
   if (!info) return null;
   
@@ -2505,12 +2513,15 @@ function refToLocator(page, ref, refs) {
     log('warn', 'refToLocator: frame not found for iframe ref', { ref, frameName, frameUrl: frameUrl?.slice(0, 60) });
   }
   
-  let locator = page.getByRole(role, name ? { name } : undefined);
-  
+  // When refs were built under a scope selector, resolve within the same
+  // scoped root -- nth indices are counted within that subtree.
+  const resolutionRoot = scopeSelector ? page.locator(scopeSelector).first() : page;
+  let locator = resolutionRoot.getByRole(role, name ? { name } : undefined);
+
   // Always use .nth() to disambiguate duplicate role+name combinations
   // This avoids "strict mode violation" when multiple elements match
   locator = locator.nth(nth);
-  
+
   return locator;
 }
 
@@ -2523,7 +2534,7 @@ async function refreshTabRefs(tabState, options = {}) {
 
   const beforeUrl = tabState.page?.url?.() || '';
   const existingRefs = tabState.refs instanceof Map ? tabState.refs : new Map();
-  const refreshPromise = buildRefs(tabState.page);
+  const refreshPromise = buildRefs(tabState.page, tabState.refScope || null);
 
   let refreshedRefs;
   if (timeoutMs) {
@@ -3125,6 +3136,10 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           await navigateCurrentPage();
         }
         
+        // Navigation lands on a new page -- any snapshot scope from the
+        // previous page no longer applies.
+        tabState.refScope = null;
+
         // For Google SERP: skip eager ref building during navigate.
         // Results render asynchronously after DOMContentLoaded -- the snapshot
         // call will wait for and extract them.
@@ -3198,6 +3213,11 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
  *         schema:
  *           type: integer
  *         description: Character offset for paginated retrieval.
+ *       - name: selector
+ *         in: query
+ *         schema:
+ *           type: string
+ *         description: CSS selector scoping the snapshot (and its refs) to one subtree. First match wins. Refs stay valid for click/type until the next navigation or a snapshot without selector. 400 on invalid selector, 404 if it matches nothing. Ignored on offset>0 continuation requests.
  *       - name: includeScreenshot
  *         in: query
  *         schema:
@@ -3258,6 +3278,22 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       return res.json(response);
     }
 
+    const selector = typeof req.query.selector === 'string' && req.query.selector.trim() ? req.query.selector.trim() : null;
+    if (selector) {
+      let matchCount;
+      try {
+        matchCount = await tabState.page.locator(selector).count();
+      } catch (selErr) {
+        return res.status(400).json({ error: `invalid selector: ${selErr.message.split('\n')[0]}`, selector });
+      }
+      if (matchCount === 0) {
+        return res.status(404).json({ error: 'selector matched no elements', selector });
+      }
+    }
+    // Scope governs this snapshot AND subsequent ref resolution (click/type)
+    // until the next navigation or a snapshot without selector.
+    tabState.refScope = selector;
+
     const result = await withUserLimit(userId, () => withTimeout((async () => {
       if (proxyPool?.canRotateSessions && isGoogleSearchUrl(tabState.lastRequestedUrl || '')) {
         const blocked = await isGoogleSearchBlocked(tabState.page);
@@ -3281,7 +3317,8 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       const pageUrl = tabState.page.url();
       
       // Google SERP fast path -- DOM extraction instead of ariaSnapshot
-      if (isGoogleSerp(pageUrl)) {
+      // (bypassed when a selector scope was requested)
+      if (!selector && isGoogleSerp(pageUrl)) {
         const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
         tabState.refs = googleRefs;
         tabState.lastSnapshot = googleSnapshot;
@@ -3305,7 +3342,7 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
       }
       
       tabState.refs = await refreshTabRefs(tabState, { reason: 'snapshot' });
-      const ariaYaml = await getAriaSnapshot(tabState.page);
+      const ariaYaml = await getAriaSnapshot(tabState.page, selector);
       
       let annotatedYaml = ariaYaml || '';
       if (annotatedYaml && tabState.refs.size > 0) {
@@ -3603,7 +3640,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       };
       
       if (ref) {
-        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        let locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
         if (!locator) {
           // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
           log('info', 'auto-refreshing refs before click', { ref, hadRefs: tabState.refs.size });
@@ -3617,7 +3654,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
               throw e;
             }
           }
-          locator = refToLocator(tabState.page, ref, tabState.refs);
+          locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
         }
         if (!locator) {
           const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
@@ -3638,6 +3675,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         // and the caller always requests /snapshot next which rebuilds refs.
         tabState.lastSnapshot = null;
         tabState.refs = new Map();
+        tabState.refScope = null; // SERP click navigates -- scope no longer applies
         const newUrl = tabState.page.url();
         tabState.visitedUrls.add(newUrl);
         return { ok: true, url: newUrl, refsAvailable: false };
@@ -3821,12 +3859,12 @@ app.post('/tabs/:tabId/upload', async (req, res) => {
       if (!attachedVia) {
         let locator;
         if (ref) {
-          locator = refToLocator(tabState.page, ref, tabState.refs);
+          locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
           if (!locator) {
             try {
               tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_upload', timeoutMs: UPLOAD_REFS_TIMEOUT_MS });
             } catch (e) { /* proceed without refresh */ }
-            locator = refToLocator(tabState.page, ref, tabState.refs);
+            locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
           }
           if (!locator) {
             const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
@@ -4006,11 +4044,11 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       // Resolve and focus the target if ref/selector provided
       let locator = null;
       if (ref) {
-        locator = refToLocator(tabState.page, ref, tabState.refs);
+        locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
         if (!locator) {
           log('info', 'auto-refreshing refs before type', { ref, hadRefs: tabState.refs.size, mode });
           tabState.refs = await refreshTabRefs(tabState, { reason: 'type' });
-          locator = refToLocator(tabState.page, ref, tabState.refs);
+          locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
         }
         if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
       }
@@ -4506,6 +4544,7 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
  *   get:
  *     tags: [Content]
  *     summary: Extract page links
+ *     description: Links in DOM order. On nav-heavy pages the first page of results is mostly header/sidebar chrome — pass selector to scope to a content container, or paginate with limit/offset.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -4517,6 +4556,21 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: limit
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 50
+ *       - name: offset
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *       - name: selector
+ *         in: query
+ *         schema:
+ *           type: string
+ *         description: CSS selector; only links inside the first matching element are returned. 404 if it matches nothing.
  *     responses:
  *       200:
  *         description: Links extracted.
@@ -4532,10 +4586,19 @@ app.post('/tabs/:tabId/refresh', async (req, res) => {
  *                     properties:
  *                       text:
  *                         type: string
- *                       href:
+ *                       url:
  *                         type: string
- *                       ref:
- *                         type: string
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                     offset:
+ *                       type: integer
+ *                     limit:
+ *                       type: integer
+ *                     hasMore:
+ *                       type: boolean
  *       404:
  *         description: Tab not found.
  *         content:
@@ -4559,10 +4622,13 @@ app.get('/tabs/:tabId/links', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
+    const linkSelector = typeof req.query.selector === 'string' && req.query.selector.trim() ? req.query.selector.trim() : null;
     const result = await withTabLock(req.params.tabId, async () => {
-      const allLinks = await tabState.page.evaluate(() => {
+      const allLinks = await tabState.page.evaluate((sel) => {
+        const root = sel ? document.querySelector(sel) : document;
+        if (!root) return null;
         const links = [];
-        document.querySelectorAll('a[href]').forEach(a => {
+        root.querySelectorAll('a[href]').forEach(a => {
           const href = a.href;
           const text = a.textContent?.trim().slice(0, 100) || '';
           if (href && href.startsWith('http')) {
@@ -4570,8 +4636,10 @@ app.get('/tabs/:tabId/links', async (req, res) => {
           }
         });
         return links;
-      });
-      
+      }, linkSelector);
+
+      if (allLinks === null) return { noMatch: true };
+
       const total = allLinks.length;
       const paginated = allLinks.slice(offset, offset + limit);
       
@@ -4580,7 +4648,10 @@ app.get('/tabs/:tabId/links', async (req, res) => {
         pagination: { total, offset, limit, hasMore: offset + limit < total }
       };
     });
-    
+
+    if (result.noMatch) {
+      return res.status(404).json({ error: 'selector matched no elements', selector: linkSelector });
+    }
     res.json(result);
   } catch (err) {
     log('error', 'links failed', { reqId: req.reqId, error: err.message });
@@ -6348,11 +6419,11 @@ app.post('/act', async (req, res) => {
           };
           
           if (ref) {
-            let locator = refToLocator(tabState.page, ref, tabState.refs);
+            let locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             if (!locator) {
               log('info', 'auto-refreshing refs before click (openclaw)', { ref, hadRefs: tabState.refs.size });
               tabState.refs = await buildRefs(tabState.page);
-              locator = refToLocator(tabState.page, ref, tabState.refs);
+              locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
             await doClick(locator, true);
@@ -6379,11 +6450,11 @@ app.post('/act', async (req, res) => {
           
           let locator = null;
           if (ref) {
-            locator = refToLocator(tabState.page, ref, tabState.refs);
+            locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             if (!locator) {
               log('info', 'auto-refreshing refs before type (openclaw)', { ref, hadRefs: tabState.refs.size, mode });
               tabState.refs = await buildRefs(tabState.page);
-              locator = refToLocator(tabState.page, ref, tabState.refs);
+              locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
           }
@@ -6417,10 +6488,10 @@ app.post('/act', async (req, res) => {
         case 'scrollIntoView': {
           const { ref, direction = 'down', amount = 500 } = params;
           if (ref) {
-            let locator = refToLocator(tabState.page, ref, tabState.refs);
+            let locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             if (!locator) {
               tabState.refs = await buildRefs(tabState.page);
-              locator = refToLocator(tabState.page, ref, tabState.refs);
+              locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
             await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
@@ -6438,10 +6509,10 @@ app.post('/act', async (req, res) => {
           if (!ref && !selector) throw new Error('ref or selector required');
           
           if (ref) {
-            let locator = refToLocator(tabState.page, ref, tabState.refs);
+            let locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             if (!locator) {
               tabState.refs = await buildRefs(tabState.page);
-              locator = refToLocator(tabState.page, ref, tabState.refs);
+              locator = refToLocator(tabState.page, ref, tabState.refs, tabState.refScope);
             }
             if (!locator) { const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none'; throw new StaleRefsError(ref, maxRef, tabState.refs.size); }
             await locator.hover({ timeout: 5000 });
