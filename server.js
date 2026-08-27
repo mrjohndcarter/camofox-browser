@@ -3415,7 +3415,8 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  * /tabs/{tabId}/wait:
  *   post:
  *     tags: [Interaction]
- *     summary: Wait for a selector or timeout
+ *     summary: Wait for a selector, or for general page readiness
+ *     description: With selector, waits for that element to appear (ready=false + timedOut=true on timeout). Without, waits for page readiness (domcontentloaded, network, hydration, settle).
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -3434,9 +3435,16 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  *                 type: string
  *               selector:
  *                 type: string
+ *                 description: CSS selector to wait for. Omit to wait for page readiness instead.
  *               timeout:
  *                 type: integer
- *                 description: Max wait in ms.
+ *                 description: Max wait in ms (default 10000).
+ *               waitForNetwork:
+ *                 type: boolean
+ *                 description: Readiness mode only (default true).
+ *               dismissConsent:
+ *                 type: boolean
+ *                 description: Readiness mode only (default false).
  *     responses:
  *       200:
  *         description: Wait completed.
@@ -3447,6 +3455,10 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  *               properties:
  *                 ok:
  *                   type: boolean
+ *                 ready:
+ *                   type: boolean
+ *                 timedOut:
+ *                   type: boolean
  *       404:
  *         description: Tab not found.
  *         content:
@@ -3456,15 +3468,33 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
  */
 app.post('/tabs/:tabId/wait', async (req, res) => {
   try {
-    const { userId, timeout = 10000, waitForNetwork = true, dismissConsent = false } = req.body;
+    const { userId, timeout = 10000, waitForNetwork = true, dismissConsent = false, selector = null } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
     session.lastAccess = Date.now();
-    
+
     const { tabState } = found;
+
+    // Selector mode: wait for a specific element (the spec always advertised
+    // this; the implementation previously ignored it and only did readiness).
+    if (selector) {
+      try {
+        await tabState.page.waitForSelector(selector, { timeout });
+        return res.json({ ok: true, ready: true, selector });
+      } catch (selErr) {
+        if (/timeout/i.test(selErr.message)) {
+          return res.json({ ok: true, ready: false, timedOut: true, selector });
+        }
+        if (/not a valid selector|selector.*invalid|failed to parse/i.test(selErr.message)) {
+          return res.status(400).json({ error: `invalid selector: ${selErr.message.split('\n')[0]}`, selector });
+        }
+        throw selErr;
+      }
+    }
+
     const ready = await waitForPageReady(tabState.page, { timeout, waitForNetwork, dismissConsent });
-    
+
     res.json({ ok: true, ready });
   } catch (err) {
     log('error', 'wait failed', { reqId: req.reqId, error: err.message });
@@ -4811,7 +4841,7 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *   get:
  *     tags: [Content]
  *     summary: Take a screenshot
- *     description: Returns a base64-encoded PNG screenshot.
+ *     description: Returns raw PNG bytes (Content-Type image/png), not JSON.
  *     parameters:
  *       - name: tabId
  *         in: path
@@ -4823,21 +4853,20 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: fullPage
+ *         in: query
+ *         schema:
+ *           type: string
+ *           enum: ['true', 'false']
+ *         description: Capture the full scrollable page instead of the viewport.
  *     responses:
  *       200:
  *         description: Screenshot.
  *         content:
- *           application/json:
+ *           image/png:
  *             schema:
- *               type: object
- *               properties:
- *                 screenshot:
- *                   type: object
- *                   properties:
- *                     data:
- *                       type: string
- *                     mimeType:
- *                       type: string
+ *               type: string
+ *               format: binary
  *       404:
  *         description: Tab not found.
  *         content:
