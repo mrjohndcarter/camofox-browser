@@ -2401,10 +2401,10 @@ async function _buildRefsInner(page, refs, start, scopeSelector = null) {
           }
         }
         
-        log('debug', 'buildRefs: processed iframe', { frameName, frameUrl: frameUrl.slice(0, 80), refs: refCounter - 1 });
+        log('debug', 'buildRefs: processed iframe', { frameName: frameName?.slice(0, 80), frameUrl: frameUrl.slice(0, 80), refs: refCounter - 1 });
       } catch (err) {
         // Frame might have navigated away or be inaccessible — skip silently
-        log('debug', 'buildRefs: iframe snapshot failed', { frameName, error: err.message?.slice(0, 80) });
+        log('debug', 'buildRefs: iframe snapshot failed', { frameName: frameName?.slice(0, 80), error: err.message?.slice(0, 80) });
       }
     }
     
@@ -2510,7 +2510,7 @@ function refToLocator(page, ref, refs, scopeSelector = null) {
       return locator;
     }
     // Frame not found (navigated away?) — fall through to page-level resolution
-    log('warn', 'refToLocator: frame not found for iframe ref', { ref, frameName, frameUrl: frameUrl?.slice(0, 60) });
+    log('warn', 'refToLocator: frame not found for iframe ref', { ref, frameName: frameName?.slice(0, 60), frameUrl: frameUrl?.slice(0, 60) });
   }
   
   // When refs were built under a scope selector, resolve within the same
