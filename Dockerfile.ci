@@ -67,6 +67,10 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY scripts/ ./scripts/
+# package.json's postinstall hook runs `node postinstall.js` during `npm ci`,
+# so the script has to be in the image before that line, not with the later
+# source COPYs -- otherwise npm ci dies with MODULE_NOT_FOUND on /app/postinstall.js.
+COPY postinstall.js ./
 # Build tools are needed when better-sqlite3 has no native prebuild for the target.
 # Trixie's glibc also supports the upstream arm64 prebuild at runtime.
 RUN npm ci --omit=dev \
