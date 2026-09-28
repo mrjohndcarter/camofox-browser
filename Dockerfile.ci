@@ -67,13 +67,22 @@ WORKDIR /app
 
 COPY package.json package-lock.json ./
 COPY scripts/ ./scripts/
-# package.json's postinstall hook runs `node postinstall.js` during `npm ci`,
-# so the script has to be in the image before that line, not with the later
-# source COPYs -- otherwise npm ci dies with MODULE_NOT_FOUND on /app/postinstall.js.
+# package.json's postinstall hook runs `node postinstall.js` during `npm ci`, so
+# both the script AND lib/ have to be in the image before that line, not with the
+# later source COPYs. postinstall.js statically imports ./lib/camoufox-download.js
+# at module top -- that resolves before main() runs, so neither the
+# CAMOFOX_SKIP_DOWNLOAD guard nor the "already cached" check can prevent an
+# ERR_MODULE_NOT_FOUND without lib/ present.
 COPY postinstall.js ./
+COPY lib/ ./lib/
 # Build tools are needed when better-sqlite3 has no native prebuild for the target.
 # Trixie's glibc also supports the upstream arm64 prebuild at runtime.
-RUN npm ci --omit=dev \
+#
+# CAMOFOX_SKIP_DOWNLOAD=1 because the Camoufox binary is already fetched
+# explicitly above -- without it postinstall re-fetches the whole browser inside
+# the build. (It would also short-circuit on the cached version.json that step
+# writes, but this states the intent rather than relying on that path matching.)
+RUN CAMOFOX_SKIP_DOWNLOAD=1 npm ci --omit=dev \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 
